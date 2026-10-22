@@ -12,7 +12,11 @@ Built with **Node.js**, **discord.js v14**, and **SQLite (`better-sqlite3`)**.
 - **🔐 Permissions & Rank System**: 9-tier NYSRP staff authority hierarchy (`Owner` ➔ `Junior Moderator`) with strict server-side hierarchy protection preventing unauthorized actions, self-promotions, or rank bypasses.
 - **📈 Promotion / Demotion System**: Full rank change audit trail, role synchronization, and NYSRP formatted staff update logs.
 - **👮 Staff Management System**: Comprehensive staff directory, roster list, individual staff profiles, performance metrics, and history logs.
-- **🎫 Ticket System**: Interactive support panel with select menu categories, private ticket channels, role permissions, HTML transcript generation, claim, lock, unlock, and delete controls.
+- **🎫 Ticket System**: Interactive support panel with select menu categories, private ticket channels, paginated HTML transcripts, audited priorities, claim, lock, unlock, and safe close controls.
+- **📊 Polls**: Persistent single- or multiple-choice polls with unique votes, live results, scheduled closure, and restart recovery.
+- **📅 Events & Giveaways**: Scheduled events with RSVP buttons, persistent giveaway entries, automatic winner selection, and deadline recovery.
+- **🚦 SSU Lifecycle**: Persistent session votes, atomic vote counting, recoverable vote messages, and guarded SSU start/end transitions.
+- **🚔 ER:LC Status**: Official API status embeds and persistent auto-updating panels with response caching and rate-limit handling.
 - **💡 Suggestion System**: Persistent suggestion panel, modal submissions, up/down voting, staff decisions, and a restart-safe rolling call-to-action in the configured suggestions channel.
 - **👋 Welcome System**: Automated welcome embeds adhering strictly to the NYSRP master embed style.
 - **⚙️ Centralized Guild Configuration**: Dynamic channel, category, and rank-to-role mappings saved per guild in SQLite.
@@ -64,6 +68,7 @@ NYSRP_Bot/
 │
 ├── database/
 │   ├── db.js                    # SQLite database connection (better-sqlite3)
+│   ├── migrations.js            # Transactional, versioned additive migrations
 │   └── schema.sql               # Database table initialization schema
 │
 ├── utils/
@@ -76,6 +81,10 @@ NYSRP_Bot/
 │   ├── moderationService.js     # Moderation actions, DB tracking & logging
 │   ├── staffService.js          # Rank promotions, demotions & roster profiles
 │   ├── ticketService.js         # Ticket channel management & state handling
+│   ├── pollService.js           # Persistent polls, voting, results & scheduler
+│   ├── eventService.js          # Scheduled events, RSVPs, giveaways & scheduler
+│   ├── sessionService.js        # Session vote and recoverable SSU lifecycle
+│   ├── erlcService.js           # Official ER:LC API status and status panels
 │   ├── suggestionService.js     # Suggestion panel, submissions, votes & decisions
 │   ├── welcomeService.js        # Member join event welcome handler
 │   └── configService.js         # Guild settings management
@@ -90,7 +99,7 @@ NYSRP_Bot/
 │   ├── staff/                   # /staff (view, list, profile, promote, demote, history, info)
 │   ├── tickets/                 # /ticket (panel, close, lock, unlock, add, remove)
 │   ├── configuration/           # /config (set-channel, set-category, set-role, view)
-│   └── utility/                 # /ping, /help
+│   └── utility/                 # /ping, /help, /poll, /event, /erlc, /session
 │
 └── events/
     ├── ready.js                 # Ready event & presence status
@@ -120,6 +129,35 @@ NYSRP_Bot/
 3. Self-promotion and self-demotion are blocked.
 
 Suggestion decisions require the existing rank-based **Suggestion Manage** permission (Internal Affairs+).
+
+## 🎫 Ticket Priorities and Transcripts
+
+Ticket transcripts retrieve channel history in pages, include author IDs, timestamps, attachments, and embeds, and split large archives into multiple files. A ticket is not deleted until all transcript files are delivered to the configured archive. If delivery fails, the ticket remains accessible and can be retried. Messages deleted before transcript generation cannot be recovered.
+
+Staff can use `/ticket priority` inside a ticket to set Low, Normal, High, or Urgent priority. Priority changes are audited in SQLite, and `/ticket list` sorts open tickets by urgency.
+
+## 📊 Polls
+
+Staff with the rank-based **Poll Manage** permission can create polls using `/poll create`. Polls support 2-10 unique answer options, single-choice or multiple-selection voting, and durations from one minute to seven days. Votes and results persist in SQLite; the poll closes and disables its buttons automatically at the deadline. `/poll close` closes a poll early.
+
+## 📅 Events and Giveaways
+
+Staff with the rank-based **Event Manage** permission can use `/event create` to schedule an event with an ISO 8601 start time and duration, or `/event giveaway` to open entries for a prize and choose up to 20 winners at random when it closes. `/event list`, `/event close`, and `/event cancel` manage active events. RSVPs, entries, and selected winners persist across restarts.
+
+## 🚦 Session and SSU Lifecycle
+
+`/session start` creates one persistent vote per server. Each member can vote once; counts and the pass transition are atomic. Passing notifies the configured SSU role but does not start the SSU. `/session ssu-start` and `/session ssu-end` use guarded transitions and only finalize after the corresponding announcement is sent. Interrupted transitions and missing vote messages are reconciled after restart; failed pass notifications are retried.
+
+## 🚔 ER:LC Status Integration
+
+1. Purchase/enable the ER:LC API pack for the private server and place its server key in `.env` as `ERLC_SERVER_KEY`. Never commit or share that key.
+2. Use `/erlc status` to view the latest API result.
+3. A member with **Bot Configure** permission can run `/erlc panel` in a text channel to create or refresh that server's persistent status panel. The panel refreshes once per minute.
+4. Optionally set `ERLC_JOIN_URL` to an official HTTPS Roblox private-server invitation URL to enable the direct **Join Server** button. Without that link, the panel offers a **Show Join Code** action using the current API-provided code.
+
+The integration requests the documented v2 server endpoint with `Players=true` and `Queue=true`, caches responses, and honors `Retry-After` when rate-limited. The panel uses the existing NYSRP Session Start banner and orange brand accent; it displays player capacity, queue, staff counted from the documented online-player permission field, server name, owner, join code, and the last successful API update when available. It only labels the server offline when the API returns documented error code `3002`; API failures are shown as unavailable or explicitly stale rather than current. API credentials are never displayed, and mentions are disabled in status messages.
+
+References: [ER:LC server information endpoint](https://apidocs.erlc.gg/api-reference/fetch-server-information), [error codes](https://apidocs.erlc.gg/error-codes), and [rate limits](https://apidocs.erlc.gg/rate-limits).
 
 ## 💡 Suggestion System
 
@@ -153,6 +191,8 @@ The bot creates and persists the suggestion panel and rolling call-to-action in 
    CLIENT_ID=your_application_client_id
    GUILD_ID=your_guild_id
    PREFIX=/
+   ERLC_SERVER_KEY=your_erlc_private_server_api_key
+   ERLC_JOIN_URL=
    ```
 
 3. **Discord Gateway Intents**:
@@ -173,8 +213,17 @@ node index.js
 
 Upon starting:
 - SQLite tables will be initialized automatically in `./data/nysrp.db`.
-- All 13 slash commands will deploy to your target guild automatically.
+- Versioned, additive SQLite migrations will be applied automatically.
+- Slash commands will deploy to your target guild automatically.
 - Console logs will confirm bot readiness.
+
+Before deploying a database migration, stop the bot and create a SQLite-consistent backup of `data/nysrp.db`. Migrations are additive and run transactionally; do not replace or delete the existing database.
+
+Run the focused regression suite with:
+
+```bash
+npm test
+```
 
 ---
 

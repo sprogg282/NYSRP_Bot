@@ -1,6 +1,9 @@
 const TicketService = require('../services/ticketService');
 const FeedbackService = require('../services/feedbackService');
 const SessionService = require('../services/sessionService');
+const PollService = require('../services/pollService');
+const EventService = require('../services/eventService');
+const ERLCService = require('../services/erlcService');
 const StaffService = require('../services/staffService');
 const SuggestionService = require('../services/suggestionService');
 const { hasPermission } = require('../utils/permissionCheck');
@@ -195,6 +198,33 @@ async function handleComponentInteraction(interaction) {
 
     // 3. Button Interactions
     if (interaction.isButton()) {
+        if (interaction.customId === 'erlc_show_join_code'
+            || interaction.customId === 'erlc_refresh_status') {
+            return ERLCService.handleButton(interaction);
+        }
+
+        const eventParticipation = interaction.customId.match(/^(?:event_rsvp|giveaway_enter):(\d+)$/);
+        if (eventParticipation) {
+            if (!interaction.guild) {
+                return interaction.reply({
+                    embeds: [createErrorEmbed('Participation Failed', 'Event participation is only available inside the server where the event was created.')],
+                    ephemeral: true
+                });
+            }
+            return EventService.handleParticipation(interaction, Number(eventParticipation[1]));
+        }
+
+        const pollVote = interaction.customId.match(/^poll_vote:(\d+):(\d+)$/);
+        if (pollVote) {
+            if (!interaction.guild) {
+                return interaction.reply({
+                    embeds: [createErrorEmbed('Poll Vote Failed', 'Poll voting is only available inside the server where the poll was created.')],
+                    ephemeral: true
+                });
+            }
+            return PollService.handleVote(interaction, Number(pollVote[1]), Number(pollVote[2]));
+        }
+
         if (interaction.customId === 'suggestion_panel_submit') {
             try {
                 return await interaction.showModal(SuggestionService.buildSubmitModal());
@@ -332,11 +362,31 @@ async function handleComponentInteraction(interaction) {
 
         switch (interaction.customId) {
             case 'ticket_close':
-                await interaction.reply({
-                    embeds: [createSuccessEmbed('Closing Ticket', 'Initiating ticket closure and transcript generation...')]
-                });
-                await TicketService.closeTicket(interaction.channel, ticket, interaction.member);
-                break;
+                await interaction.deferReply({ ephemeral: true });
+                try {
+                    const result = await TicketService.closeTicket(interaction.channel, ticket, interaction.member);
+                    if (result.status === 'already_closed') {
+                        return interaction.editReply({
+                            embeds: [createErrorEmbed('Ticket Already Closed', 'This ticket has already been closed and its transcript was handled.')]
+                        });
+                    }
+                    if (result.status === 'already_closing') {
+                        return interaction.editReply({
+                            embeds: [createErrorEmbed('Ticket Closure In Progress', 'A close operation is already running for this ticket. Please wait for it to finish.')]
+                        });
+                    }
+                    return interaction.editReply({
+                        embeds: [createSuccessEmbed(
+                            'Ticket Closed',
+                            `The transcript was delivered to the configured archive. Captured **${result.messageCount}** messages in **${result.partCount}** file part(s). The channel will be deleted in 10 seconds.`
+                        )]
+                    });
+                } catch (error) {
+                    logger.error(`[Tickets] Close button failed for ticket #${ticket.ticket_id}:`, error);
+                    return interaction.editReply({
+                        embeds: [createErrorEmbed('Ticket Close Failed', error.message)]
+                    });
+                }
 
             case 'ticket_lock':
                 if (!isStaff) {
@@ -345,11 +395,17 @@ async function handleComponentInteraction(interaction) {
                         ephemeral: true
                     });
                 }
-                await TicketService.lockTicket(interaction.channel, ticket, interaction.member);
-                await interaction.reply({
-                    embeds: [createSuccessEmbed('Ticket Locked', 'Channel locked successfully.')],
-                    ephemeral: true
-                });
+                await interaction.deferReply({ ephemeral: true });
+                try {
+                    await TicketService.lockTicket(interaction.channel, ticket, interaction.member);
+                    await interaction.editReply({
+                        embeds: [createSuccessEmbed('Ticket Locked', 'Channel locked successfully.')]
+                    });
+                } catch (error) {
+                    await interaction.editReply({
+                        embeds: [createErrorEmbed('Ticket Lock Failed', error.message)]
+                    });
+                }
                 break;
 
             case 'ticket_unlock':
@@ -359,11 +415,17 @@ async function handleComponentInteraction(interaction) {
                         ephemeral: true
                     });
                 }
-                await TicketService.unlockTicket(interaction.channel, ticket, interaction.member);
-                await interaction.reply({
-                    embeds: [createSuccessEmbed('Ticket Unlocked', 'Channel unlocked successfully.')],
-                    ephemeral: true
-                });
+                await interaction.deferReply({ ephemeral: true });
+                try {
+                    await TicketService.unlockTicket(interaction.channel, ticket, interaction.member);
+                    await interaction.editReply({
+                        embeds: [createSuccessEmbed('Ticket Unlocked', 'Channel unlocked successfully.')]
+                    });
+                } catch (error) {
+                    await interaction.editReply({
+                        embeds: [createErrorEmbed('Ticket Unlock Failed', error.message)]
+                    });
+                }
                 break;
 
             case 'ticket_claim':
@@ -373,27 +435,60 @@ async function handleComponentInteraction(interaction) {
                         ephemeral: true
                     });
                 }
+                await interaction.deferReply({ ephemeral: true });
                 try {
                     await TicketService.claimTicket(interaction.channel, interaction.member);
-                    await interaction.reply({
-                        embeds: [createSuccessEmbed('Ticket Claimed', 'You have claimed this support ticket.')],
-                        ephemeral: true
+                    await interaction.editReply({
+                        embeds: [createSuccessEmbed('Ticket Claimed', 'You have claimed this support ticket.')]
                     });
                 } catch (err) {
-                    await interaction.reply({
-                        embeds: [createErrorEmbed('Claim Failed', err.message)],
-                        ephemeral: true
+                    await interaction.editReply({
+                        embeds: [createErrorEmbed('Claim Failed', err.message)]
                     });
                 }
                 break;
 
             case 'ticket_transcript':
                 await interaction.deferReply({ ephemeral: true });
-                const { attachment } = await generateTranscript(interaction.channel, ticket);
-                await interaction.editReply({
-                    content: 'Here is the current transcript for this ticket:',
-                    files: [attachment]
-                });
+                let deliveredBatches = 0;
+                try {
+                    const transcript = await generateTranscript(interaction.channel, ticket);
+                    const batches = [];
+                    for (let offset = 0; offset < transcript.attachments.length; offset += 10) {
+                        batches.push(transcript.attachments.slice(offset, offset + 10));
+                    }
+                    await interaction.editReply({
+                        content: `Transcript contains ${transcript.messageCount} messages across ${transcript.partCount} file part(s).`,
+                        files: batches[0] || []
+                    });
+                    deliveredBatches = 1;
+                    for (const batch of batches.slice(1)) {
+                        await interaction.followUp({
+                            content: 'Additional transcript files:',
+                            files: batch,
+                            ephemeral: true
+                        });
+                        deliveredBatches += 1;
+                    }
+                } catch (error) {
+                    logger.error(`[Tickets] Manual transcript generation failed for ticket #${ticket.ticket_id}:`, error);
+                    const report = {
+                        embeds: [createErrorEmbed(
+                            deliveredBatches
+                                ? 'Transcript Partially Delivered'
+                                : 'Transcript Failed',
+                            deliveredBatches
+                                ? `Only ${deliveredBatches} file batch(es) were delivered. The transcript is incomplete; try again after checking the archive. ${error.message}`
+                                : `No transcript was delivered because full history could not be generated. The ticket remains available. ${error.message}`
+                        )],
+                        ephemeral: true
+                    };
+                    if (deliveredBatches) {
+                        await interaction.followUp(report);
+                    } else {
+                        await interaction.editReply(report);
+                    }
+                }
                 break;
 
             case 'ticket_delete':
@@ -403,11 +498,24 @@ async function handleComponentInteraction(interaction) {
                         ephemeral: true
                     });
                 }
+                if (ticket.status !== 'CLOSED' || !ticket.transcript_delivered_at) {
+                    return interaction.reply({
+                        embeds: [createErrorEmbed(
+                            'Transcript Required',
+                            'A ticket cannot be force-deleted until its transcript has been delivered successfully. Use Close first.'
+                        )],
+                        ephemeral: true
+                    });
+                }
                 await interaction.reply({ content: 'Deleting ticket channel immediately...' });
                 try {
                     await interaction.channel.delete('NYSRP Ticket Deleted by Staff');
-                } catch {
-                    // channel already deleted
+                } catch (error) {
+                    logger.warn(`[Tickets] Could not delete closed ticket #${ticket.ticket_id}: ${error.message}`);
+                    await interaction.followUp({
+                        embeds: [createErrorEmbed('Ticket Deletion Failed', `The transcript is archived, but the channel could not be deleted. ${error.message}`)],
+                        ephemeral: true
+                    });
                 }
                 break;
 

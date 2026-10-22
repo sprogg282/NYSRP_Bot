@@ -18,4 +18,7 @@ const schemaPath = path.join(__dirname, 'schema.sql');
 const schema = fs.readFileSync(schemaPath, 'utf8');
 db.exec(schema);
 
+const { applyMigrations } = require('./migrations');
+applyMigrations(db);
+
 module.exports = db;

@@ -24,6 +24,9 @@ const PERMISSIONS = {
 
     // Support / Ticket Permissions
     TICKET_MANAGE: 'TICKET_MANAGE',
+    TICKET_PRIORITY: 'TICKET_PRIORITY',
+    POLL_MANAGE: 'POLL_MANAGE',
+    EVENT_MANAGE: 'EVENT_MANAGE',
 
     // Log Access
     LOGS_VIEW: 'LOGS_VIEW',
@@ -52,6 +55,9 @@ const MIN_RANK_LEVEL = {
     [PERMISSIONS.SUGGESTION_MANAGE]: 6,   // Internal Affairs+
 
     [PERMISSIONS.TICKET_MANAGE]: 1,      // Junior Moderator+
+    [PERMISSIONS.TICKET_PRIORITY]: 1,   // Junior Moderator+
+    [PERMISSIONS.POLL_MANAGE]: 1,       // Junior Moderator+
+    [PERMISSIONS.EVENT_MANAGE]: 1,      // Junior Moderator+
 
     [PERMISSIONS.LOGS_VIEW]: 4,          // Administrator+
 

@@ -6,6 +6,11 @@ const { getValidatedChannel } = require('../utils/channelValidator');
 const { getImage } = require('../utils/imageManager');
 const logger = require('../utils/logger');
 
+let notificationRetryTimer = null;
+let retryingNotifications = false;
+let retryingVoteMessages = false;
+const pendingVoteMessageSync = new Set();
+
 class SessionService {
     /**
      * Check if a member has the SSU Permission role (1545826232178839573) or server admin authority
@@ -23,6 +28,94 @@ class SessionService {
         return false;
     }
 
+    static buildVotePayload(session, passed, imageUrl = null) {
+        const requiredVotes = session.required_yes_votes || config.sessionVote.requiredYesVotes;
+        const embed = createNYSRPEmbed({
+            title: passed ? '𝙉𝙔𝙎𝙍𝙋 𝙎𝙚𝙨𝙨𝙞𝙤𝙣 𝙑𝙤𝙩𝙚 𝙋𝙖𝙨𝙨𝙚𝙙' : '𝙉𝙔𝙎𝙍𝙋 𝙎𝙚𝙨𝙨𝙞𝙤𝙣 𝙑𝙤𝙩𝙚',
+            introduction: passed
+                ? 'The NYSRP Session Vote has reached the required number of YES votes.'
+                : 'A session vote is currently active. Cast your vote below if you would like NYSRP to host a session.',
+            sections: [
+                {
+                    title: passed ? 'Vote Result' : 'Session Vote',
+                    items: [
+                        `✅ **Yes:** ${session.yes_votes}`,
+                        `❌ **No:** ${session.no_votes}`,
+                        `🎯 **Required:** ${requiredVotes}`
+                    ]
+                },
+                {
+                    title: 'Status',
+                    items: [passed ? '🟢 **Vote Passed — Awaiting Staff SSU Start**' : '🟡 **Voting in Progress**']
+                },
+                {
+                    title: 'Started By',
+                    items: [`<@${session.started_by}>`]
+                }
+            ],
+            closing: passed
+                ? 'The vote has passed. An authorized staff member must manually start the SSU.'
+                : 'You may only vote once.',
+            color: config.branding.color
+        });
+        if (imageUrl) embed.setImage(imageUrl);
+
+        const buttons = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId(`session_vote_yes_${session.session_id}`)
+                .setLabel('Yes')
+                .setStyle(ButtonStyle.Success)
+                .setEmoji('✅')
+                .setDisabled(passed),
+            new ButtonBuilder()
+                .setCustomId(`session_vote_no_${session.session_id}`)
+                .setLabel('No')
+                .setStyle(ButtonStyle.Danger)
+                .setEmoji('❌')
+                .setDisabled(passed)
+        );
+        return { embeds: [embed], components: [buttons] };
+    }
+
+    static async sendVotePassedNotice(session, client) {
+        const channel = await client.channels.fetch(session.channel_id);
+        if (!channel || typeof channel.send !== 'function') {
+            throw new Error(`The session channel ${session.channel_id} is unavailable.`);
+        }
+        const rolePing = `<@&${config.roles.ssuPermission}>`;
+        const notice = createNYSRPEmbed({
+            title: '𝙎𝙚𝙨𝙨𝙞𝙤𝙣 𝙑𝙤𝙩𝙚 𝙋𝙖𝙨𝙨𝙚𝙙',
+            introduction: 'The NYSRP Session Vote has reached the required number of YES votes.',
+            important: 'The SSU is ready to be started. An authorized staff member must manually use `/session ssu-start`.',
+            sections: [
+                {
+                    title: 'Vote Result',
+                    items: [
+                        `✅ **Yes:** ${session.yes_votes}`,
+                        `❌ **No:** ${session.no_votes}`,
+                        `🎯 **Required:** ${session.required_yes_votes || config.sessionVote.requiredYesVotes}`
+                    ]
+                },
+                {
+                    title: 'Action Required',
+                    items: [
+                        rolePing,
+                        'An authorized staff member with the SSU Permission role must manually run `/session ssu-start`.'
+                    ]
+                }
+            ],
+            closing: 'The SSU has NOT been started automatically.',
+            color: config.branding.color
+        });
+        await channel.send({
+            content: rolePing,
+            embeds: [notice],
+            allowedMentions: { roles: [config.roles.ssuPermission] }
+        });
+        db.prepare('UPDATE sessions SET vote_passed_notified = 1 WHERE session_id = ?')
+            .run(session.session_id);
+    }
+
     /**
      * Check cooldown and active session state
      * @param {string} guildId 
@@ -31,14 +124,17 @@ class SessionService {
     static checkCooldownAndActiveState(guildId) {
         const activeSession = db.prepare(`
             SELECT * FROM sessions 
-            WHERE guild_id = ? AND status IN ('VOTING', 'VOTE_PASSED', 'SSU_ACTIVE')
+            WHERE guild_id = ? AND status IN (
+                'VOTING', 'VOTE_PASSED', 'SSU_STARTING', 'SSU_ACTIVE', 'SSU_ENDING'
+            )
             ORDER BY session_id DESC LIMIT 1
         `).get(guildId);
 
         if (activeSession) {
             let stateLabel = 'active vote';
             if (activeSession.status === 'VOTE_PASSED') stateLabel = 'passed vote awaiting SSU start';
-            if (activeSession.status === 'SSU_ACTIVE') stateLabel = 'active SSU';
+            if (activeSession.status === 'SSU_STARTING') stateLabel = 'SSU start in progress';
+            if (activeSession.status === 'SSU_ACTIVE' || activeSession.status === 'SSU_ENDING') stateLabel = 'active SSU';
             return {
                 canStart: false,
                 remainingMinutes: 0,
@@ -81,81 +177,70 @@ class SessionService {
             };
         }
 
-        const cooldown = this.checkCooldownAndActiveState(guild.id);
-        if (!cooldown.canStart) {
-            return {
-                success: false,
-                embed: createErrorEmbed('Session Start Blocked', cooldown.reason)
-            };
-        }
-
-        const timestamp = Date.now();
-        const requiredVotes = config.sessionVote.requiredYesVotes; // 5
-
-        // Insert into DB
-        const result = db.prepare(`
-            INSERT INTO sessions (guild_id, status, channel_id, started_by, vote_started_at, required_yes_votes, yes_votes, no_votes)
-            VALUES (?, 'VOTING', ?, ?, ?, ?, 0, 0)
-        `).run(guild.id, config.channels.session, member.id, timestamp, requiredVotes);
-
-        const sessionId = result.lastInsertRowid;
-
-        // Build Buttons
-        const buttons = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`session_vote_yes_${sessionId}`).setLabel('Yes').setStyle(ButtonStyle.Success).setEmoji('✅'),
-            new ButtonBuilder().setCustomId(`session_vote_no_${sessionId}`).setLabel('No').setStyle(ButtonStyle.Danger).setEmoji('❌')
-        );
-
-        // Build Vote Embed
-        const voteEmbed = createNYSRPEmbed({
-            title: '𝙉𝙔𝙎𝙍𝙋 𝙎𝙚𝙨𝙨𝙞𝙤𝙣 𝙑𝙤𝙩𝙚',
-            introduction: 'A session vote is currently active. Cast your vote below if you would like NYSRP to host a session.',
-            sections: [
-                {
-                    title: 'Session Vote',
-                    items: [
-                        '✅ **Yes:** 0',
-                        '❌ **No:** 0',
-                        `🎯 **Required:** ${requiredVotes}`
-                    ]
-                },
-                {
-                    title: 'Status',
-                    items: [
-                        '🟡 **Voting in Progress**'
-                    ]
-                },
-                {
-                    title: 'Started By',
-                    items: [
-                        `<@${member.id}>`
-                    ]
-                }
-            ],
-            closing: 'You may only vote once.',
-            color: config.branding.color // #FD8701
-        });
-        const voteImage = getImage('sessionVote');
-        const voteFiles = [];
-        if (voteImage) {
-            voteEmbed.setImage(voteImage.url);
-            voteFiles.push(voteImage.attachment);
-        }
-
-        // Send to Session Channel (1515413881256677496)
         const sessionChannel = await getValidatedChannel(guild, config.channels.session, 'Session');
         if (!sessionChannel) {
-            db.prepare("UPDATE sessions SET status = 'CLOSED' WHERE session_id = ?").run(sessionId);
             return {
                 success: false,
                 embed: createErrorEmbed('Channel Error', `The session channel (${config.channels.session}) is missing or inaccessible.`)
             };
         }
 
-        const voteMsg = await sessionChannel.send({ embeds: [voteEmbed], components: [buttons], files: voteFiles });
+        const timestamp = Date.now();
+        const requiredVotes = config.sessionVote.requiredYesVotes;
+        const creation = db.transaction(() => {
+            const cooldown = this.checkCooldownAndActiveState(guild.id);
+            if (!cooldown.canStart) return { cooldown };
+            const result = db.prepare(`
+                INSERT INTO sessions (
+                    guild_id, status, channel_id, started_by, vote_started_at,
+                    required_yes_votes, yes_votes, no_votes
+                ) VALUES (?, 'VOTING', ?, ?, ?, ?, 0, 0)
+            `).run(guild.id, sessionChannel.id, member.id, timestamp, requiredVotes);
+            return { sessionId: Number(result.lastInsertRowid) };
+        })();
+        if (creation.cooldown) {
+            return {
+                success: false,
+                embed: createErrorEmbed('Session Start Blocked', creation.cooldown.reason)
+            };
+        }
 
-        // Update DB with message ID
-        db.prepare('UPDATE sessions SET vote_message_id = ? WHERE session_id = ?').run(voteMsg.id, sessionId);
+        const sessionId = creation.sessionId;
+        let voteMessage = null;
+        try {
+            const session = db.prepare('SELECT * FROM sessions WHERE session_id = ?').get(sessionId);
+            const payload = this.buildVotePayload(session, false);
+            const voteImage = getImage('sessionVote');
+            if (voteImage) {
+                payload.embeds[0].setImage(voteImage.url);
+                payload.files = [voteImage.attachment];
+            }
+            voteMessage = await sessionChannel.send(payload);
+            const result = db.prepare(`
+                UPDATE sessions SET vote_message_id = ?
+                WHERE session_id = ? AND status = 'VOTING'
+            `).run(voteMessage.id, sessionId);
+            if (result.changes !== 1) {
+                throw new Error('The vote was posted, but its database record could not be finalized.');
+            }
+        } catch (error) {
+            if (voteMessage) {
+                try {
+                    await voteMessage.delete('Session vote could not be recorded');
+                } catch (cleanupError) {
+                    logger.error(`[Session] Could not remove untracked vote message ${voteMessage.id}:`, cleanupError);
+                }
+            }
+            db.prepare(`
+                UPDATE sessions SET status = 'CLOSED', session_ended_at = ?
+                WHERE session_id = ? AND status = 'VOTING'
+            `).run(Date.now(), sessionId);
+            logger.error(`[Session] Could not publish vote #${sessionId}:`, error);
+            return {
+                success: false,
+                embed: createErrorEmbed('Session Vote Failed', `The session vote could not be posted. The incomplete vote was closed. ${error.message}`)
+            };
+        }
 
         return {
             success: true,
@@ -181,176 +266,109 @@ class SessionService {
      * Process member vote submission
      */
     static async processVote(interaction, voteChoice) {
-        const parts = interaction.customId.split('_'); // session_vote_yes_<sessionId>
-        const sessionId = parseInt(parts[3], 10);
-
-        const session = db.prepare('SELECT * FROM sessions WHERE session_id = ?').get(sessionId);
-        if (!session) {
-            return interaction.reply({
-                embeds: [createErrorEmbed('Invalid Session', 'This session vote record was not found.')],
-                ephemeral: true
+        await interaction.deferReply({ ephemeral: true });
+        const match = interaction.customId.match(/^session_vote_(yes|no)_(\d+)$/);
+        const sessionId = match ? Number(match[2]) : NaN;
+        if (!Number.isSafeInteger(sessionId)
+            || !['YES', 'NO'].includes(voteChoice)
+            || match[1].toUpperCase() !== voteChoice) {
+            return interaction.editReply({
+                embeds: [createErrorEmbed('Invalid Session Vote', 'This vote control is not valid.') ]
             });
         }
 
-        if (session.status !== 'VOTING') {
-            return interaction.reply({
-                embeds: [createErrorEmbed('Voting Closed', 'Voting for this session has ended or the vote has already passed.')],
-                ephemeral: true
-            });
-        }
-
-        // Check duplicate vote
-        const existingVote = db.prepare('SELECT * FROM session_voters WHERE session_id = ? AND user_id = ?').get(sessionId, interaction.user.id);
-        if (existingVote) {
-            return interaction.reply({
-                embeds: [createErrorEmbed('Vote Rejected', 'You have already cast your vote for this session vote. You may only vote once.')],
-                ephemeral: true
-            });
-        }
-
-        const timestamp = Date.now();
-        db.prepare('INSERT INTO session_voters (session_id, user_id, vote_choice, voted_at) VALUES (?, ?, ?, ?)')
-            .run(sessionId, interaction.user.id, voteChoice, timestamp);
-
-        let newYes = session.yes_votes;
-        let newNo = session.no_votes;
-
-        if (voteChoice === 'YES') {
-            newYes += 1;
-            db.prepare('UPDATE sessions SET yes_votes = yes_votes + 1 WHERE session_id = ?').run(sessionId);
-        } else {
-            newNo += 1;
-            db.prepare('UPDATE sessions SET no_votes = no_votes + 1 WHERE session_id = ?').run(sessionId);
-        }
-
-        const requiredVotes = session.required_yes_votes || config.sessionVote.requiredYesVotes;
-
-        // Check if vote passed (5 YES votes reached)
-        if (newYes >= requiredVotes) {
-            db.prepare("UPDATE sessions SET status = 'VOTE_PASSED', vote_passed_at = ? WHERE session_id = ?").run(timestamp, sessionId);
-
-            // Update Vote Message with disabled buttons
-            try {
-                const passedEmbed = createNYSRPEmbed({
-                    title: '𝙉𝙔𝙎𝙍𝙋 𝙎𝙚𝙨𝙨𝙞𝙤𝙣 𝙑𝙤𝙩𝙚 𝙋𝙖𝙨𝙨𝙚𝙙',
-                    introduction: 'The NYSRP Session Vote has reached the required number of YES votes.',
-                    sections: [
-                        {
-                            title: 'Vote Result',
-                            items: [
-                                `✅ **Yes:** ${newYes}`,
-                                `❌ **No:** ${newNo}`,
-                                `🎯 **Required:** ${requiredVotes}`
-                            ]
-                        },
-                        {
-                            title: 'Status',
-                            items: [
-                                '🟢 **Vote Passed — Awaiting Staff SSU Start**'
-                            ]
-                        },
-                        {
-                            title: 'Started By',
-                            items: [
-                                `<@${session.started_by}>`
-                            ]
-                        }
-                    ],
-                    closing: 'The vote has passed. An authorized staff member must manually start the SSU.',
-                    color: config.branding.color // #FD8701
-                });
-                const voteImageUrl = interaction.message.embeds[0]?.image?.url;
-                if (voteImageUrl) passedEmbed.setImage(voteImageUrl);
-
-                const disabledButtons = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder().setCustomId(`session_vote_yes_${sessionId}`).setLabel('Yes').setStyle(ButtonStyle.Success).setEmoji('✅').setDisabled(true),
-                    new ButtonBuilder().setCustomId(`session_vote_no_${sessionId}`).setLabel('No').setStyle(ButtonStyle.Danger).setEmoji('❌').setDisabled(true)
-                );
-
-                await interaction.message.edit({ embeds: [passedEmbed], components: [disabledButtons] });
-            } catch (err) {
-                logger.warn(`Could not edit passed vote message ${session.vote_message_id}: ${err.message}`);
-            }
-
-            // Ping SSU Permission role in channel notifying staff that SSU is ready to be manually started
-            const ssuRolePing = `<@&${config.roles.ssuPermission}>`;
-            const staffNoticeEmbed = createNYSRPEmbed({
-                title: '𝙎𝙚𝙨𝙨𝙞𝙤𝙣 𝙑𝙤𝙩𝙚 𝙋𝙖𝙨𝙨𝙚𝙙',
-                introduction: 'The NYSRP Session Vote has reached the required number of YES votes.',
-                important: 'The SSU is ready to be started. An authorized staff member must manually use `/session ssu-start`.',
-                sections: [
-                    {
-                        title: 'Vote Result',
-                        items: [
-                            `✅ **Yes:** ${newYes}`,
-                            `❌ **No:** ${newNo}`,
-                            `🎯 **Required:** ${requiredVotes}`
-                        ]
-                    },
-                    {
-                        title: 'Action Required',
-                        items: [
-                            `${ssuRolePing}`,
-                            'An authorized staff member with the SSU Permission role must manually run `/session ssu-start`.'
-                        ]
-                    }
-                ],
-                closing: 'The SSU has NOT been started automatically.',
-                color: config.branding.color // #FD8701
-            });
-
-            await interaction.channel.send({
-                content: ssuRolePing,
-                embeds: [staffNoticeEmbed]
-            });
-
-            return interaction.reply({
-                embeds: [createSuccessEmbed('Vote Passed!', `Your vote (YES) pushed the total to **${newYes} YES votes**! The vote has passed and staff have been notified to manually start the SSU.`)],
-                ephemeral: true
-            });
-        }
-
-        // Vote still in progress
+        let session;
         try {
-            const updatedEmbed = createNYSRPEmbed({
-                title: '𝙉𝙔𝙎𝙍𝙋 𝙎𝙚𝙨𝙨𝙞𝙤𝙣 𝙑𝙤𝙩𝙚',
-                introduction: 'A session vote is currently active. Cast your vote below if you would like NYSRP to host a session.',
-                sections: [
-                    {
-                        title: 'Session Vote',
-                        items: [
-                            `✅ **Yes:** ${newYes}`,
-                            `❌ **No:** ${newNo}`,
-                            `🎯 **Required:** ${requiredVotes}`
-                        ]
-                    },
-                    {
-                        title: 'Status',
-                        items: [
-                            '🟡 **Voting in Progress**'
-                        ]
-                    },
-                    {
-                        title: 'Started By',
-                        items: [
-                            `<@${session.started_by}>`
-                        ]
-                    }
-                ],
-                closing: 'You may only vote once.',
-                color: config.branding.color // #FD8701
-            });
-            const voteImageUrl = interaction.message.embeds[0]?.image?.url;
-            if (voteImageUrl) updatedEmbed.setImage(voteImageUrl);
+            session = db.transaction(() => {
+                const current = db.prepare('SELECT * FROM sessions WHERE session_id = ?').get(sessionId);
+                if (!current
+                    || current.guild_id !== interaction.guildId
+                    || current.channel_id !== interaction.channelId
+                    || current.vote_message_id !== interaction.message.id) {
+                    throw new Error('This session vote message is no longer valid.');
+                }
+                if (current.status !== 'VOTING') {
+                    throw new Error('Voting for this session has ended or the vote has already passed.');
+                }
+                if (db.prepare(`
+                    SELECT 1 FROM session_voters WHERE session_id = ? AND user_id = ?
+                `).get(sessionId, interaction.user.id)) {
+                    throw new Error('You have already cast a vote for this session. You may only vote once.');
+                }
 
-            await interaction.message.edit({ embeds: [updatedEmbed] });
-        } catch (err) {
-            logger.warn(`Could not update vote message ${session.vote_message_id}: ${err.message}`);
+                const timestamp = Date.now();
+                db.prepare(`
+                    INSERT INTO session_voters (session_id, user_id, vote_choice, voted_at)
+                    VALUES (?, ?, ?, ?)
+                `).run(sessionId, interaction.user.id, voteChoice, timestamp);
+                const yesVotes = current.yes_votes + (voteChoice === 'YES' ? 1 : 0);
+                const noVotes = current.no_votes + (voteChoice === 'NO' ? 1 : 0);
+                const requiredVotes = current.required_yes_votes || config.sessionVote.requiredYesVotes;
+                const passed = yesVotes >= requiredVotes;
+                const update = db.prepare(`
+                    UPDATE sessions
+                    SET yes_votes = ?, no_votes = ?,
+                        status = ?, vote_passed_at = CASE WHEN ? THEN ? ELSE vote_passed_at END
+                    WHERE session_id = ? AND status = 'VOTING'
+                `).run(
+                    yesVotes,
+                    noVotes,
+                    passed ? 'VOTE_PASSED' : 'VOTING',
+                    passed ? 1 : 0,
+                    timestamp,
+                    sessionId
+                );
+                if (update.changes !== 1) {
+                    throw new Error('Voting has already ended for this session.');
+                }
+                return {
+                    ...current,
+                    yes_votes: yesVotes,
+                    no_votes: noVotes,
+                    status: passed ? 'VOTE_PASSED' : 'VOTING'
+                };
+            })();
+        } catch (error) {
+            return interaction.editReply({
+                embeds: [createErrorEmbed('Vote Rejected', error.message)]
+            });
         }
 
-        return interaction.reply({
-            embeds: [createSuccessEmbed('Vote Recorded', `Your vote (**${voteChoice}**) has been counted for Session Vote #${sessionId}.`)],
-            ephemeral: true
+        let messageUpdated = true;
+        try {
+            await interaction.message.edit(this.buildVotePayload(
+                session,
+                session.status === 'VOTE_PASSED',
+                interaction.message.embeds[0]?.image?.url
+            ));
+            pendingVoteMessageSync.delete(sessionId);
+        } catch (error) {
+            messageUpdated = false;
+            pendingVoteMessageSync.add(sessionId);
+            logger.warn(`[Session] Vote #${sessionId} was recorded, but its message could not be updated: ${error.message}`);
+        }
+
+        let notificationPending = false;
+        if (session.status === 'VOTE_PASSED' && !session.vote_passed_notified) {
+            try {
+                await this.sendVotePassedNotice(session, interaction.client);
+            } catch (error) {
+                notificationPending = true;
+                logger.error(`[Session] Vote #${sessionId} passed, but the SSU notification could not be delivered:`, error);
+            }
+        }
+
+        const response = session.status === 'VOTE_PASSED'
+            ? `Your vote (**${voteChoice}**) was counted. Session Vote #${sessionId} has passed.`
+            : `Your vote (**${voteChoice}**) has been counted for Session Vote #${sessionId}.`;
+        const details = [];
+        if (!messageUpdated) details.push('The public vote display could not be refreshed.');
+        if (notificationPending) details.push('The staff notification is pending automatic retry.');
+        return interaction.editReply({
+            embeds: [createSuccessEmbed(
+                session.status === 'VOTE_PASSED' ? 'Vote Passed!' : 'Vote Recorded',
+                details.length ? `${response}\n\n${details.join(' ')}` : response
+            )]
         });
     }
 
@@ -415,11 +433,6 @@ class SessionService {
         }
 
         const timestamp = Date.now();
-        db.prepare(`
-            UPDATE sessions 
-            SET status = 'SSU_ACTIVE', ssu_started_by = ?, ssu_started_at = ?
-            WHERE session_id = ?
-        `).run(member.id, timestamp, session.session_id);
 
         const dateString = `<t:${Math.floor(timestamp / 1000)}:F>`;
 
@@ -447,8 +460,45 @@ class SessionService {
         }
 
         const sessionChannel = await getValidatedChannel(guild, config.channels.session, 'Session');
-        if (sessionChannel) {
+        if (!sessionChannel) {
+            return {
+                success: false,
+                embed: createErrorEmbed('Channel Error', `The session channel (${config.channels.session}) is missing or inaccessible. The SSU was not started.`)
+            };
+        }
+
+        const reservation = db.prepare(`
+            UPDATE sessions SET status = 'SSU_STARTING'
+            WHERE session_id = ? AND status = 'VOTE_PASSED'
+        `).run(session.session_id);
+        if (reservation.changes !== 1) {
+            return {
+                success: false,
+                embed: createErrorEmbed('Session Changed', 'The session state changed before the SSU could start. Check `/session status` and try again if appropriate.')
+            };
+        }
+
+        try {
             await sessionChannel.send({ embeds: [ssuAnnouncementEmbed], files: sessionStartFiles });
+        } catch (error) {
+            db.prepare(`
+                UPDATE sessions SET status = 'VOTE_PASSED'
+                WHERE session_id = ? AND status = 'SSU_STARTING'
+            `).run(session.session_id);
+            logger.error(`[Session] Could not announce SSU start for session #${session.session_id}:`, error);
+            return {
+                success: false,
+                embed: createErrorEmbed('SSU Start Failed', `The start announcement could not be sent, so the SSU remains ready to start. ${error.message}`)
+            };
+        }
+
+        const started = db.prepare(`
+            UPDATE sessions
+            SET status = 'SSU_ACTIVE', ssu_started_by = ?, ssu_started_at = ?
+            WHERE session_id = ? AND status = 'SSU_STARTING'
+        `).run(member.id, timestamp, session.session_id);
+        if (started.changes !== 1) {
+            throw new Error(`SSU start announcement was sent, but session #${session.session_id} could not be finalized.`);
         }
 
         return {
@@ -498,12 +548,6 @@ class SessionService {
         const timestamp = Date.now();
         const durationMinutes = Math.max(1, Math.floor((timestamp - (session.ssu_started_at || timestamp)) / 60000));
 
-        db.prepare(`
-            UPDATE sessions 
-            SET status = 'SSU_ENDED', ssu_ended_by = ?, ssu_ended_at = ?
-            WHERE session_id = ?
-        `).run(member.id, timestamp, session.session_id);
-
         const startDateStr = `<t:${Math.floor((session.ssu_started_at || timestamp) / 1000)}:F>`;
         const endDateStr = `<t:${Math.floor(timestamp / 1000)}:F>`;
 
@@ -534,8 +578,45 @@ class SessionService {
         }
 
         const sessionChannel = await getValidatedChannel(guild, config.channels.session, 'Session');
-        if (sessionChannel) {
+        if (!sessionChannel) {
+            return {
+                success: false,
+                embed: createErrorEmbed('Channel Error', `The session channel (${config.channels.session}) is missing or inaccessible. The SSU remains active.`)
+            };
+        }
+
+        const reservation = db.prepare(`
+            UPDATE sessions SET status = 'SSU_ENDING'
+            WHERE session_id = ? AND status = 'SSU_ACTIVE'
+        `).run(session.session_id);
+        if (reservation.changes !== 1) {
+            return {
+                success: false,
+                embed: createErrorEmbed('Session Changed', 'The session state changed before the SSU could end. Check `/session status` and try again if appropriate.')
+            };
+        }
+
+        try {
             await sessionChannel.send({ embeds: [ssuEndAnnouncementEmbed], files: sessionEndFiles });
+        } catch (error) {
+            db.prepare(`
+                UPDATE sessions SET status = 'SSU_ACTIVE'
+                WHERE session_id = ? AND status = 'SSU_ENDING'
+            `).run(session.session_id);
+            logger.error(`[Session] Could not announce SSU end for session #${session.session_id}:`, error);
+            return {
+                success: false,
+                embed: createErrorEmbed('SSU End Failed', `The end announcement could not be sent, so the SSU remains active. ${error.message}`)
+            };
+        }
+
+        const ended = db.prepare(`
+            UPDATE sessions
+            SET status = 'SSU_ENDED', ssu_ended_by = ?, ssu_ended_at = ?
+            WHERE session_id = ? AND status = 'SSU_ENDING'
+        `).run(member.id, timestamp, session.session_id);
+        if (ended.changes !== 1) {
+            throw new Error(`SSU end announcement was sent, but session #${session.session_id} could not be finalized.`);
         }
 
         return {
@@ -581,13 +662,25 @@ class SessionService {
                 embed: createErrorEmbed('No Active Session', 'There is no active session to close.')
             };
         }
+        if (!['VOTING', 'VOTE_PASSED', 'SSU_ACTIVE', 'SSU_ENDED'].includes(session.status)) {
+            return {
+                success: false,
+                embed: createErrorEmbed('Session Transition In Progress', `Session #${session.session_id} is currently ${session.status.toLowerCase()}. Wait for that transition to finish before closing it.`)
+            };
+        }
 
         const timestamp = Date.now();
-        db.prepare(`
+        const result = db.prepare(`
             UPDATE sessions 
             SET status = 'CLOSED', session_ended_at = ?
-            WHERE session_id = ?
-        `).run(timestamp, session.session_id);
+            WHERE session_id = ? AND status = ?
+        `).run(timestamp, session.session_id, session.status);
+        if (result.changes !== 1) {
+            return {
+                success: false,
+                embed: createErrorEmbed('Session Changed', 'The session changed before it could be closed. Check `/session status` and try again.')
+            };
+        }
 
         return {
             success: true,
@@ -638,7 +731,9 @@ class SessionService {
         const statusMap = {
             VOTING: '🟡 **Voting in Progress**',
             VOTE_PASSED: '🟢 **Vote Passed — Awaiting Staff SSU Start**',
+            SSU_STARTING: '🟡 **SSU Start In Progress**',
             SSU_ACTIVE: '🟢 **SSU Active**',
+            SSU_ENDING: '🟡 **SSU End In Progress**',
             SSU_ENDED: '🔴 **SSU Ended**'
         };
 
@@ -684,16 +779,142 @@ class SessionService {
     /**
      * Recover active sessions on bot restart
      */
-    static recoverActiveSessions(client) {
-        try {
-            const activeSessions = db.prepare(`
-                SELECT * FROM sessions 
-                WHERE status IN ('VOTING', 'VOTE_PASSED', 'SSU_ACTIVE')
-            `).all();
-            logger.info(`[Session Recovery] Restored ${activeSessions.length} active session(s) from database.`);
-        } catch (err) {
-            logger.error('[Session Recovery Error]', err);
+    static async syncVoteMessage(client, session) {
+        if (!['VOTING', 'VOTE_PASSED'].includes(session.status)) return;
+        const channel = await client.channels.fetch(session.channel_id);
+        if (!channel || !channel.messages) {
+            throw new Error(`Session channel ${session.channel_id} is unavailable.`);
         }
+
+        let message = null;
+        if (session.vote_message_id) {
+            try {
+                message = await channel.messages.fetch(session.vote_message_id);
+            } catch (error) {
+                if (error.code !== 10008) throw error;
+            }
+        }
+
+        const passed = session.status === 'VOTE_PASSED';
+        if (message) {
+            await message.edit(this.buildVotePayload(
+                session,
+                passed,
+                message.embeds[0]?.image?.url
+            ));
+            pendingVoteMessageSync.delete(session.session_id);
+            return;
+        }
+
+        const payload = this.buildVotePayload(session, passed);
+        const voteImage = getImage('sessionVote');
+        if (voteImage) {
+            payload.embeds[0].setImage(voteImage.url);
+            payload.files = [voteImage.attachment];
+        }
+        message = await channel.send(payload);
+        const result = db.prepare(`
+            UPDATE sessions SET vote_message_id = ?
+            WHERE session_id = ? AND status IN ('VOTING', 'VOTE_PASSED')
+        `).run(message.id, session.session_id);
+        if (result.changes !== 1) {
+            try {
+                await message.delete('Session vote state changed during recovery');
+            } catch (error) {
+                logger.error(`[Session Recovery] Could not delete replacement vote message ${message.id}:`, error);
+            }
+            throw new Error(`Session #${session.session_id} changed while its vote message was being restored.`);
+        }
+        pendingVoteMessageSync.delete(session.session_id);
+    }
+
+    static async retryPendingVoteMessages(client) {
+        if (retryingVoteMessages || pendingVoteMessageSync.size === 0) return;
+        retryingVoteMessages = true;
+        try {
+            for (const sessionId of pendingVoteMessageSync) {
+                const session = db.prepare('SELECT * FROM sessions WHERE session_id = ?').get(sessionId);
+                if (!session || !['VOTING', 'VOTE_PASSED'].includes(session.status)) {
+                    pendingVoteMessageSync.delete(sessionId);
+                    continue;
+                }
+                try {
+                    await this.syncVoteMessage(client, session);
+                } catch (error) {
+                    logger.error(`[Session Recovery] Vote message sync is still pending for session #${sessionId}:`, error);
+                }
+            }
+        } finally {
+            retryingVoteMessages = false;
+        }
+    }
+
+    static async retryPendingVoteNotifications(client) {
+        if (retryingNotifications) return;
+        retryingNotifications = true;
+        try {
+            const pending = db.prepare(`
+                SELECT * FROM sessions
+                WHERE vote_passed_at IS NOT NULL AND vote_passed_notified = 0
+                ORDER BY vote_passed_at
+                LIMIT 25
+            `).all();
+            for (const session of pending) {
+                try {
+                    await this.sendVotePassedNotice(session, client);
+                    logger.info(`[Session Recovery] Delivered pending pass notification for session #${session.session_id}.`);
+                } catch (error) {
+                    logger.error(`[Session Recovery] Pass notification is still pending for session #${session.session_id}:`, error);
+                }
+            }
+        } finally {
+            retryingNotifications = false;
+        }
+    }
+
+    static async recoverActiveSessions(client) {
+        const recoveredStarting = db.prepare(`
+            UPDATE sessions
+            SET status = 'VOTE_PASSED'
+            WHERE status = 'SSU_STARTING'
+        `).run().changes;
+        const recoveredEnding = db.prepare(`
+            UPDATE sessions
+            SET status = 'SSU_ACTIVE'
+            WHERE status = 'SSU_ENDING'
+        `).run().changes;
+        const activeSessions = db.prepare(`
+            SELECT * FROM sessions
+            WHERE status IN ('VOTING', 'VOTE_PASSED', 'SSU_ACTIVE')
+            ORDER BY session_id
+        `).all();
+
+        logger.info(
+            `[Session Recovery] Restored ${activeSessions.length} active session(s); `
+            + `recovered ${recoveredStarting} interrupted start(s) and ${recoveredEnding} interrupted end(s).`
+        );
+
+        for (const session of activeSessions) {
+            try {
+                await this.syncVoteMessage(client, session);
+            } catch (error) {
+                pendingVoteMessageSync.add(session.session_id);
+                logger.error(`[Session Recovery] Could not restore vote message for session #${session.session_id}:`, error);
+            }
+        }
+        await this.retryPendingVoteNotifications(client);
+        return activeSessions.length;
+    }
+
+    static startNotificationRetry(client) {
+        if (notificationRetryTimer) return;
+        notificationRetryTimer = setInterval(() => {
+            Promise.all([
+                this.retryPendingVoteNotifications(client),
+                this.retryPendingVoteMessages(client)
+            ]).catch(error => logger.error('[Session Recovery] Pending session recovery retry failed:', error));
+        }, 30000);
+        notificationRetryTimer.unref?.();
     }
 }
 

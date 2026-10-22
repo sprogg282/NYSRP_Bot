@@ -1,6 +1,10 @@
 const logger = require('../utils/logger');
 const config = require('../config');
 const SessionService = require('../services/sessionService');
+const TicketService = require('../services/ticketService');
+const PollService = require('../services/pollService');
+const EventService = require('../services/eventService');
+const ERLCService = require('../services/erlcService');
 const SuggestionService = require('../services/suggestionService');
 const { ActivityType } = require('discord.js');
 
@@ -16,8 +20,20 @@ module.exports = {
         logger.info(` Database: SQLite WAL Engine initialized`);
         logger.info(`=================================================`);
 
-        // Recover active session state on startup
-        SessionService.recoverActiveSessions(client);
+        try {
+            await SessionService.recoverActiveSessions(client);
+        } catch (error) {
+            logger.error('[Session Recovery] Could not recover active session state:', error);
+        }
+        SessionService.startNotificationRetry(client);
+        try {
+            await TicketService.recoverInterruptedClosures(client);
+        } catch (error) {
+            logger.error('[Ticket Recovery] Could not recover interrupted ticket closures:', error);
+        }
+        await PollService.startScheduler(client);
+        await EventService.startScheduler(client);
+        await ERLCService.startScheduler(client);
         await SuggestionService.initialize(client);
 
         client.user.setPresence({

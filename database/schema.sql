@@ -46,7 +46,25 @@ CREATE TABLE IF NOT EXISTS tickets (
     claimed_by TEXT,
     created_at INTEGER NOT NULL,
     closed_at INTEGER,
-    closed_by TEXT
+    closed_by TEXT,
+    priority TEXT NOT NULL DEFAULT 'NORMAL'
+        CHECK (priority IN ('LOW', 'NORMAL', 'HIGH', 'URGENT')),
+    close_previous_status TEXT,
+    closing_started_at INTEGER,
+    transcript_message_ids TEXT NOT NULL DEFAULT '[]',
+    transcript_part_count INTEGER NOT NULL DEFAULT 0,
+    transcript_delivered_at INTEGER,
+    transcript_delivery_nonce TEXT
+);
+
+CREATE TABLE IF NOT EXISTS ticket_priority_history (
+    change_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id INTEGER NOT NULL,
+    guild_id TEXT NOT NULL,
+    changed_by TEXT NOT NULL,
+    previous_priority TEXT NOT NULL,
+    new_priority TEXT NOT NULL,
+    changed_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS staff_members (
@@ -115,7 +133,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     session_ended_at INTEGER,
     required_yes_votes INTEGER DEFAULT 5,
     yes_votes INTEGER DEFAULT 0,
-    no_votes INTEGER DEFAULT 0
+    no_votes INTEGER DEFAULT 0,
+    vote_passed_notified INTEGER NOT NULL DEFAULT 0 CHECK (vote_passed_notified IN (0, 1))
 );
 
 CREATE TABLE IF NOT EXISTS session_voters (
@@ -124,4 +143,78 @@ CREATE TABLE IF NOT EXISTS session_voters (
     vote_choice TEXT NOT NULL, -- YES or NO
     voted_at INTEGER NOT NULL,
     PRIMARY KEY (session_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS polls (
+    poll_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    message_id TEXT,
+    question TEXT NOT NULL,
+    allow_multiple INTEGER NOT NULL DEFAULT 0 CHECK (allow_multiple IN (0, 1)),
+    created_by TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    closes_at INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'OPEN',
+    closed_at INTEGER,
+    closed_by TEXT,
+    message_finalized INTEGER NOT NULL DEFAULT 0 CHECK (message_finalized IN (0, 1))
+);
+
+CREATE TABLE IF NOT EXISTS poll_options (
+    poll_id INTEGER NOT NULL,
+    option_index INTEGER NOT NULL,
+    label TEXT NOT NULL,
+    PRIMARY KEY (poll_id, option_index),
+    FOREIGN KEY (poll_id) REFERENCES polls(poll_id)
+);
+
+CREATE TABLE IF NOT EXISTS poll_votes (
+    poll_id INTEGER NOT NULL,
+    user_id TEXT NOT NULL,
+    option_index INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (poll_id, user_id, option_index),
+    FOREIGN KEY (poll_id, option_index) REFERENCES poll_options(poll_id, option_index)
+);
+
+CREATE TABLE IF NOT EXISTS events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    message_id TEXT,
+    event_type TEXT NOT NULL CHECK (event_type IN ('EVENT', 'GIVEAWAY')),
+    title TEXT NOT NULL,
+    description TEXT,
+    winner_count INTEGER,
+    created_by TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    starts_at INTEGER NOT NULL,
+    ends_at INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'ENDED', 'CANCELLED', 'FAILED')),
+    closed_at INTEGER,
+    message_finalized INTEGER NOT NULL DEFAULT 0 CHECK (message_finalized IN (0, 1))
+);
+
+CREATE TABLE IF NOT EXISTS event_entries (
+    event_id INTEGER NOT NULL,
+    user_id TEXT NOT NULL,
+    entered_at INTEGER NOT NULL,
+    PRIMARY KEY (event_id, user_id),
+    FOREIGN KEY (event_id) REFERENCES events(event_id)
+);
+
+CREATE TABLE IF NOT EXISTS event_winners (
+    event_id INTEGER NOT NULL,
+    user_id TEXT NOT NULL,
+    selected_at INTEGER NOT NULL,
+    PRIMARY KEY (event_id, user_id),
+    FOREIGN KEY (event_id) REFERENCES events(event_id)
+);
+
+CREATE TABLE IF NOT EXISTS erlc_status_panels (
+    guild_id TEXT PRIMARY KEY,
+    channel_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
 );

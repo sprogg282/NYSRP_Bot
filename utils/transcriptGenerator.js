@@ -1,190 +1,268 @@
 const { AttachmentBuilder } = require('discord.js');
 const config = require('../config');
 
-/**
- * Generates an HTML transcript file buffer from channel messages.
- * 
- * @param {TextChannel} channel 
- * @param {Object} ticketData 
- * @returns {Promise<{ attachment: AttachmentBuilder, messageCount: number }>}
- */
-async function generateTranscript(channel, ticketData) {
-    // Fetch up to 100 recent messages in chronological order
-    let fetchedMessages = await channel.messages.fetch({ limit: 100 });
-    const messages = Array.from(fetchedMessages.values()).sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+const PAGE_SIZE = 100;
+const MAX_PART_BYTES = 7 * 1024 * 1024;
 
-    const createdDate = new Date(ticketData.created_at || channel.createdTimestamp).toLocaleString();
-    const closedDate = new Date().toLocaleString();
+async function fetchAllMessages(channel) {
+    const messages = [];
+    const seenIds = new Set();
+    let before;
 
-    let htmlContent = `<!DOCTYPE html>
+    while (true) {
+        const page = await channel.messages.fetch({
+            limit: PAGE_SIZE,
+            ...(before ? { before } : {})
+        });
+        const pageMessages = Array.from(page.values());
+
+        if (pageMessages.length === 0) break;
+
+        for (const message of pageMessages) {
+            if (!seenIds.has(message.id)) {
+                seenIds.add(message.id);
+                messages.push(message);
+            }
+        }
+
+        const oldestMessage = pageMessages.reduce((oldest, message) => {
+            if (!oldest || BigInt(message.id) < BigInt(oldest.id)) return message;
+            return oldest;
+        }, null);
+
+        if (!oldestMessage || oldestMessage.id === before) {
+            throw new Error(`Transcript pagination did not advance in channel ${channel.id}.`);
+        }
+
+        before = oldestMessage.id;
+        if (pageMessages.length < PAGE_SIZE) break;
+    }
+
+    return messages.sort((a, b) => {
+        const timestampDifference = a.createdTimestamp - b.createdTimestamp;
+        return timestampDifference || (BigInt(a.id) < BigInt(b.id) ? -1 : 1);
+    });
+}
+
+function safeExternalUrl(value) {
+    return typeof value === 'string' && /^https?:\/\//i.test(value) ? value : null;
+}
+
+function renderEmbed(embed, index) {
+    const title = embed.title
+        ? `<div class="embed-title">${escapeHtml(embed.title)}</div>`
+        : '';
+    const titleUrl = safeExternalUrl(embed.url);
+    const description = embed.description
+        ? `<div class="embed-description">${escapeHtml(embed.description)}</div>`
+        : '';
+    const author = embed.author?.name
+        ? `<div class="embed-author">${escapeHtml(embed.author.name)}</div>`
+        : '';
+    const fields = Array.isArray(embed.fields)
+        ? embed.fields.map(field => `
+            <div class="embed-field${field.inline ? ' inline' : ''}">
+                <strong>${escapeHtml(field.name)}</strong>
+                <div>${escapeHtml(field.value)}</div>
+            </div>`).join('')
+        : '';
+    const footer = embed.footer?.text
+        ? `<div class="embed-footer">${escapeHtml(embed.footer.text)}</div>`
+        : '';
+    const imageUrl = safeExternalUrl(embed.image?.url);
+    const thumbnailUrl = safeExternalUrl(embed.thumbnail?.url);
+    const linkedTitle = titleUrl
+        ? `<a href="${escapeHtml(titleUrl)}" rel="noreferrer">${title}</a>`
+        : title;
+    const image = imageUrl
+        ? `<a href="${escapeHtml(imageUrl)}" rel="noreferrer">${escapeHtml(imageUrl)}</a>`
+        : '';
+    const thumbnail = thumbnailUrl
+        ? `<a href="${escapeHtml(thumbnailUrl)}" rel="noreferrer">${escapeHtml(thumbnailUrl)}</a>`
+        : '';
+    const color = Number.isInteger(embed.color)
+        ? ` style="border-left-color: #${embed.color.toString(16).padStart(6, '0')}"`
+        : '';
+
+    return `
+        <section class="embed"${color}>
+            <div class="embed-label">Embed ${index + 1}${embed.type ? ` · ${escapeHtml(embed.type)}` : ''}</div>
+            ${author}${linkedTitle}${description}
+            ${fields ? `<div class="embed-fields">${fields}</div>` : ''}
+            ${thumbnail ? `<div class="embed-media">Thumbnail: ${thumbnail}</div>` : ''}
+            ${image ? `<div class="embed-media">Image: ${image}</div>` : ''}
+            ${embed.video?.url ? `<div class="embed-media">Video: ${escapeHtml(embed.video.url)}</div>` : ''}
+            ${footer}
+        </section>`;
+}
+
+function renderMessage(message) {
+    const author = message.author || {};
+    const authorName = author.tag || author.globalName || author.username || 'Unknown author';
+    const avatarUrl = safeExternalUrl(author.displayAvatarURL?.({ extension: 'png' }));
+    const createdAt = new Date(message.createdTimestamp).toISOString();
+    const editedAt = message.editedTimestamp
+        ? new Date(message.editedTimestamp).toISOString()
+        : null;
+    const content = message.content
+        ? `<div class="content">${escapeHtml(message.content)}</div>`
+        : '';
+    const attachments = Array.from(message.attachments?.values?.() || []).map(attachment => {
+        const url = safeExternalUrl(attachment.url);
+        const name = attachment.name || 'Attachment';
+        const link = url
+            ? `<a href="${escapeHtml(url)}" rel="noreferrer">${escapeHtml(name)}</a>`
+            : escapeHtml(name);
+        const contentType = attachment.contentType
+            ? ` · ${escapeHtml(attachment.contentType)}`
+            : '';
+        const size = Number.isFinite(attachment.size)
+            ? ` · ${attachment.size.toLocaleString()} bytes`
+            : '';
+        return `<li>${link}${contentType}${size}</li>`;
+    }).join('');
+    const embeds = Array.from(message.embeds || []).map(renderEmbed).join('');
+    const avatar = avatarUrl
+        ? `<img class="avatar" src="${escapeHtml(avatarUrl)}" alt="">`
+        : '<div class="avatar placeholder"></div>';
+    const metadata = [
+        `User ID: ${escapeHtml(author.id || 'Unavailable')}`,
+        `Message ID: ${escapeHtml(message.id)}`,
+        message.webhookId ? `Webhook ID: ${escapeHtml(message.webhookId)}` : null,
+        message.pinned ? 'Pinned' : null,
+        message.type !== undefined ? `Type: ${escapeHtml(message.type)}` : null
+    ].filter(Boolean).join(' · ');
+
+    return `
+        <article class="message">
+            ${avatar}
+            <div class="message-body">
+                <header class="message-header">
+                    <strong>${escapeHtml(authorName)}</strong>
+                    <span>${escapeHtml(author.id || 'ID unavailable')}</span>
+                    <time datetime="${escapeHtml(createdAt)}">${escapeHtml(createdAt)}</time>
+                    ${editedAt ? `<span>Edited ${escapeHtml(editedAt)}</span>` : ''}
+                </header>
+                <div class="metadata">${metadata}</div>
+                ${content || (!attachments && !embeds ? '<div class="content muted">No text content</div>' : '')}
+                ${attachments ? `<ul class="attachments">${attachments}</ul>` : ''}
+                ${embeds}
+            </div>
+        </article>`;
+}
+
+function renderDocument(messageBlocks, ticketData, channel, generatedAt, partNumber, partCount) {
+    const createdAt = new Date(ticketData.created_at || channel.createdTimestamp).toISOString();
+    const closedAt = new Date(ticketData.closed_at || generatedAt).toISOString();
+    const closeLabel = ticketData.closed_by
+        ? `${ticketData.closed_by}${ticketData.closed_by_id ? ` (${ticketData.closed_by_id})` : ''}`
+        : 'System / not recorded';
+
+    return `<!doctype html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>NYSRP Ticket Transcript - #${ticketData.ticket_id || '0000'}</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>NYSRP Ticket Transcript #${escapeHtml(ticketData.ticket_id || '0000')}</title>
     <style>
-        body {
-            background-color: #0F172A;
-            color: #F8FAFC;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            margin: 0;
-            padding: 20px;
-        }
-        .header {
-            background: linear-gradient(135deg, #003366 0%, #1E3A8A 100%);
-            padding: 20px;
-            border-radius: 8px;
-            margin-bottom: 20px;
-            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.5);
-        }
-        .header h1 {
-            margin: 0 0 10px 0;
-            font-size: 24px;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        .info-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 10px;
-            font-size: 14px;
-            background: rgba(0, 0, 0, 0.2);
-            padding: 12px;
-            border-radius: 6px;
-        }
-        .chat-container {
-            background: #1E293B;
-            border-radius: 8px;
-            padding: 20px;
-        }
-        .message {
-            display: flex;
-            margin-bottom: 16px;
-            padding-bottom: 12px;
-            border-bottom: 1px solid #334155;
-        }
-        .avatar {
-            width: 40px;
-            height: 40px;
-            border-radius: 50%;
-            margin-right: 15px;
-        }
-        .msg-body {
-            flex-grow: 1;
-        }
-        .msg-header {
-            display: flex;
-            align-items: baseline;
-            gap: 10px;
-            margin-bottom: 4px;
-        }
-        .username {
-            font-weight: bold;
-            color: #38BDF8;
-        }
-        .timestamp {
-            font-size: 11px;
-            color: #94A3B8;
-        }
-        .content {
-            font-size: 14px;
-            line-height: 1.5;
-            white-space: pre-wrap;
-            word-break: break-word;
-        }
-        .embed-box {
-            background: #0F172A;
-            border-left: 4px solid #003366;
-            padding: 10px;
-            border-radius: 4px;
-            margin-top: 6px;
-            font-size: 13px;
-        }
-        .footer {
-            margin-top: 20px;
-            text-align: center;
-            font-size: 12px;
-            color: #64748B;
-        }
+        :root { color-scheme: dark; --accent: ${escapeHtml(config.branding.color)}; }
+        body { margin: 0; padding: 24px; background: #171717; color: #f4f4f4; font: 15px/1.55 system-ui, sans-serif; }
+        main { max-width: 1100px; margin: auto; }
+        .header, .chat { padding: 20px; border: 1px solid #373737; border-radius: 12px; background: #222; }
+        .header { border-left: 6px solid var(--accent); margin-bottom: 16px; }
+        h1 { margin: 0 0 14px; font-size: 24px; }
+        .details { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 8px 18px; }
+        .message { display: flex; gap: 12px; padding: 16px 0; border-bottom: 1px solid #3a3a3a; }
+        .message:last-child { border-bottom: 0; }
+        .avatar { flex: 0 0 40px; width: 40px; height: 40px; border-radius: 50%; object-fit: cover; }
+        .placeholder { background: #444; }
+        .message-body { min-width: 0; flex: 1; }
+        .message-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
+        .message-header strong { color: var(--accent); }
+        .message-header span, time, .metadata, .muted { color: #aaa; font-size: 12px; }
+        .content { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 6px; }
+        a { color: #ffc078; overflow-wrap: anywhere; }
+        .attachments { margin: 8px 0; padding-left: 20px; }
+        .embed { margin-top: 10px; padding: 10px 12px; border-left: 4px solid var(--accent); border-radius: 4px; background: #181818; }
+        .embed-label, .embed-footer, .embed-media { color: #aaa; font-size: 12px; }
+        .embed-title { margin: 3px 0; font-weight: 700; }
+        .embed-description { white-space: pre-wrap; overflow-wrap: anywhere; }
+        .embed-fields { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+        .embed-field { flex: 1 1 100%; overflow-wrap: anywhere; }
+        .embed-field.inline { flex-basis: 30%; }
+        .footer { margin-top: 14px; color: #aaa; text-align: center; font-size: 12px; }
+        @media (max-width: 600px) { body { padding: 10px; } .header, .chat { padding: 14px; } }
     </style>
 </head>
 <body>
-    <div class="header">
-        <h1>🚔 New York State Roleplay - Ticket Transcript</h1>
-        <div class="info-grid">
-            <div><strong>Ticket ID:</strong> #${ticketData.ticket_id || '0000'}</div>
-            <div><strong>Channel:</strong> #${channel.name}</div>
-            <div><strong>Category:</strong> ${ticketData.category || 'General Support'}</div>
-            <div><strong>Creator ID:</strong> ${ticketData.creator_id || 'Unknown'}</div>
-            <div><strong>Claimed By:</strong> ${ticketData.claimed_by ? `<@${ticketData.claimed_by}>` : 'Unclaimed'}</div>
-            <div><strong>Created At:</strong> ${createdDate}</div>
-            <div><strong>Closed At:</strong> ${closedDate}</div>
-            <div><strong>Closed By:</strong> ${ticketData.closed_by || 'System'}</div>
+<main>
+    <header class="header">
+        <h1>${escapeHtml(config.branding.serverName)} — Ticket Transcript</h1>
+        <div class="details">
+            <div><strong>Ticket:</strong> #${escapeHtml(ticketData.ticket_id || '0000')}</div>
+            <div><strong>Channel:</strong> #${escapeHtml(channel.name)} (${escapeHtml(channel.id)})</div>
+            <div><strong>Guild ID:</strong> ${escapeHtml(channel.guild?.id || 'Unavailable')}</div>
+            <div><strong>Category:</strong> ${escapeHtml(ticketData.category || 'General Support')}</div>
+            <div><strong>Creator ID:</strong> ${escapeHtml(ticketData.creator_id || 'Unknown')}</div>
+            <div><strong>Claimed By ID:</strong> ${escapeHtml(ticketData.claimed_by || 'Unclaimed')}</div>
+            <div><strong>Created:</strong> <time>${escapeHtml(createdAt)}</time></div>
+            <div><strong>Closed:</strong> <time>${escapeHtml(closedAt)}</time></div>
+            <div><strong>Closed by:</strong> ${escapeHtml(closeLabel)}</div>
+            <div><strong>Transcript part:</strong> ${partNumber} / ${partCount}</div>
         </div>
-    </div>
-
-    <div class="chat-container">
-`;
-
-    for (const msg of messages) {
-        if (msg.author.bot && msg.embeds.length > 0 && msg.content === '') {
-            // Render bot embed summary line
-            const avatarUrl = msg.author.displayAvatarURL({ extension: 'png' });
-            const timeStr = new Date(msg.createdTimestamp).toLocaleString();
-            htmlContent += `
-        <div class="message">
-            <img class="avatar" src="${avatarUrl}" alt="Avatar">
-            <div class="msg-body">
-                <div class="msg-header">
-                    <span class="username">${escapeHtml(msg.author.tag)}</span>
-                    <span class="timestamp">${timeStr}</span>
-                </div>
-                <div class="embed-box">
-                    <strong>[BOT EMBED]</strong> ${escapeHtml(msg.embeds[0].title || '')} - ${escapeHtml(msg.embeds[0].description || '')}
-                </div>
-            </div>
-        </div>`;
-            continue;
-        }
-
-        const avatarUrl = msg.author.displayAvatarURL({ extension: 'png' });
-        const timeStr = new Date(msg.createdTimestamp).toLocaleString();
-        const contentStr = escapeHtml(msg.content || '[No Text Content]');
-
-        htmlContent += `
-        <div class="message">
-            <img class="avatar" src="${avatarUrl}" alt="Avatar">
-            <div class="msg-body">
-                <div class="msg-header">
-                    <span class="username">${escapeHtml(msg.author.tag)}</span>
-                    <span class="timestamp">${timeStr}</span>
-                </div>
-                <div class="content">${contentStr}</div>
-            </div>
-        </div>`;
-    }
-
-    htmlContent += `
-    </div>
-    <div class="footer">
-        Generated by NYSRP Official Ticket System • ${new Date().toISOString()}
-    </div>
+    </header>
+    <section class="chat">${messageBlocks.join('\n')}</section>
+    <div class="footer">Generated by the NYSRP ticket system at ${escapeHtml(generatedAt.toISOString())}</div>
+</main>
 </body>
 </html>`;
+}
 
-    const buffer = Buffer.from(htmlContent, 'utf-8');
-    const attachment = new AttachmentBuilder(buffer, { name: `transcript-ticket-${ticketData.ticket_id || '0000'}.html` });
+async function generateTranscript(channel, ticketData) {
+    const messages = await fetchAllMessages(channel);
+    const blocks = messages.map(renderMessage);
+    const parts = [];
+    let currentPart = [];
+    let currentBytes = 0;
+
+    for (const block of blocks) {
+        const blockBytes = Buffer.byteLength(block, 'utf8');
+        if (blockBytes > MAX_PART_BYTES - 2048) {
+            throw new Error(`A message in ticket #${ticketData.ticket_id} is too large to place in a Discord transcript attachment.`);
+        }
+        if (currentPart.length > 0 && currentBytes + blockBytes > MAX_PART_BYTES - 2048) {
+            parts.push(currentPart);
+            currentPart = [];
+            currentBytes = 0;
+        }
+        currentPart.push(block);
+        currentBytes += blockBytes;
+    }
+
+    if (currentPart.length > 0 || parts.length === 0) parts.push(currentPart);
+
+    const generatedAt = new Date();
+    const baseName = `transcript-ticket-${ticketData.ticket_id || '0000'}`;
+    const attachments = parts.map((part, index) => {
+        const html = renderDocument(part, ticketData, channel, generatedAt, index + 1, parts.length);
+        if (Buffer.byteLength(html, 'utf8') > MAX_PART_BYTES) {
+            throw new Error(`Transcript part ${index + 1} exceeds the safe Discord upload size.`);
+        }
+        const suffix = parts.length > 1 ? `-part-${String(index + 1).padStart(3, '0')}` : '';
+        return new AttachmentBuilder(Buffer.from(html, 'utf8'), {
+            name: `${baseName}${suffix}.html`
+        });
+    });
 
     return {
-        attachment,
-        messageCount: messages.length
+        attachments,
+        messageCount: messages.length,
+        partCount: attachments.length
     };
 }
 
-function escapeHtml(text) {
-    if (!text) return '';
-    return text
+function escapeHtml(value) {
+    return String(value ?? '')
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
@@ -193,5 +271,7 @@ function escapeHtml(text) {
 }
 
 module.exports = {
-    generateTranscript
+    generateTranscript,
+    fetchAllMessages,
+    escapeHtml
 };

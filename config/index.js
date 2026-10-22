@@ -5,6 +5,10 @@ module.exports = {
     clientId: process.env.CLIENT_ID,
     guildId: process.env.GUILD_ID,
     prefix: process.env.PREFIX || '/',
+    erlc: {
+        serverKey: process.env.ERLC_SERVER_KEY || '',
+        joinUrl: process.env.ERLC_JOIN_URL || ''
+    },
 
     // Centralized Official NYSRP Color (#FD8701)
     branding: {
